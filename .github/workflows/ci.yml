@@ -1,0 +1,61 @@
+name: CI
+
+# Runs on release tags (v2.0.0, ...). Run it on a branch by hand from the
+# Actions tab (workflow_dispatch).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  host:
+    name: host check-all (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu: x86-64 (A76 engines build their portable C path);
+        # macos-14: AArch64 (A76 engines build their NEON assembly).
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: example check-all (both targets, both models, against the references)
+        run: make -C example check-all
+      - name: Cortex-M7 benchmark output check (host build)
+        run: |
+          make -C bench/cortex-m7
+          for m in a2lite a2full; do
+            (cd bench/cortex-m7 && ./host_m7_bench ../../weights/$m.namb | tee out.txt)
+            grep -q '^output: .*: OK$' bench/cortex-m7/out.txt
+          done
+
+  cortex-m7:
+    name: Cortex-M7 emulation and builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install arm-none-eabi-gcc, newlib, Unicorn
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi
+          python3 -m pip install --user unicorn pyelftools
+      - name: Emulated Cortex-M7 vs NeuralAmpModelerCore references
+        run: make -C test/m7emu check
+      - name: -Werror builds (Cortex-M7 with assembly, Cortex-M4F with C tiles)
+        run: |
+          for d in engines/cortex-m7/*; do
+            for f in $d/*.c; do
+              for mb in 48 16; do
+                defs="-DNAM_A2LITE_MAX_BUFFER_SIZE=$mb -DNAM_A2FULL_MAX_BUFFER_SIZE=$mb"
+                arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -mfpu=fpv5-d16 -mfloat-abi=hard -O2 -ffast-math \
+                  -std=c99 -Wall -Wextra -Werror $defs -c $f -o /dev/null
+                arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=hard -O2 -ffast-math \
+                  -std=c99 -Wall -Wextra -Werror -DNAM_M7_ASM=0 $defs -c $f -o /dev/null
+              done
+            done
+          done
+          inc="-Iexample -Iengines/cortex-m7/a2lite -Iengines/cortex-m7/a2full -Inamb -Ibench/cortex-m7"
+          for f in example/a2_engine.c example/m7_integration.c bench/cortex-m7/m7_bench.c namb/namb_reader.c; do
+            arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -mfpu=fpv5-d16 -mfloat-abi=hard -O2 -ffast-math \
+              -std=c99 -Wall -Wextra -Werror '-DA2_HOT=__attribute__((section(".dtcmram_bss")))' $inc -c $f -o /dev/null
+          done
